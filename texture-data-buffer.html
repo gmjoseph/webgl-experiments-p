@@ -1,0 +1,380 @@
+<html>
+    <head>
+        <title>R8 texture2D WebGL</title>
+        <style>
+            body {
+                background-color: black;
+                margin: 0;
+                padding: 0;
+            }
+            #main {
+                display: flex;
+                height: 100%;
+                justify-content: center;
+                align-items: center;
+            }
+            canvas {
+                max-height: 100%;
+            }
+        </style>
+    </head>
+    <body>
+        <section id="main">
+            <canvas id="canvas" height="1280" width="1280"></canvas>
+        </section>
+    </body>
+    <script>
+    // Storing random data in a texture:
+    // https://stackoverflow.com/questions/59421544/sampling-integer-texture-in-webgl-returns-weird-values
+    // https://stackoverflow.com/questions/43905968/how-to-get-32-bit-integer-texture-working-in-webgl-2-0
+    // https://community.khronos.org/t/sampling-bit-fields-from-a-texture-in-a-frag-shader/105772
+    // https://stackoverflow.com/questions/14961098/precise-control-over-texture-bits-in-glsl
+    /* 
+        function main() {
+        const gl = document.querySelector('canvas').getContext('webgl2');
+        if (!gl) {
+            return alert('need WebGL2');
+        }
+        const vs = `#version 300 es
+        void main() {
+            gl_PointSize = 300.0;
+            gl_Position = vec4(0, 0, 0, 1);
+        }
+        `;
+        const fs = `#version 300 es
+        precision highp float;
+        precision highp int;
+        precision highp isampler2D;
+
+        // our texture
+        uniform isampler2D u_image;
+
+        out vec4 color;
+        
+        void main() {
+            ivec4 intColor = texture(u_image, gl_PointCoord.xy);
+            color = vec4(vec3(intColor.rrr) / 10000.0, 1);
+        }
+        `;
+        
+        const program = twgl.createProgram(gl, [vs, fs]);
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,               // mip level
+            gl.R16I,         // internal format
+            10,              // width
+            1,               // height
+            0,               // border
+            gl.RED_INTEGER,  // source format
+            gl.SHORT,        // source type
+            new Int16Array([
+                1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000
+            ]));
+        // can't filter integer textures
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        
+        gl.useProgram(program);
+        
+        // no need to set any attributes or
+        // uniforms as we're not using attributes
+        // and uniforms default to zero so will use
+        // texture unit zero
+        gl.drawArrays(gl.POINTS, 0, 1);
+        
+        console.log('max point size:', gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1]);
+        }
+        main();
+    */
+
+    const SHADER_NAME = 'shader';
+
+    class Shader {
+        constructor(gl, vertCode, fragCode) {
+            this.program = null;
+            this.setupShader(gl, vertCode, fragCode);
+        }
+
+        setupShader(gl, vertCode, fragCode) {
+            const log = (shader) => {
+                const compiled = gl.getShaderParameter(shader, gl.COMPILE_STATUS);
+                if (!compiled) {
+                    console.log('Shader compiled failed: ' + compiled);
+                
+                    const compilationLog = gl.getShaderInfoLog(shader);
+                    console.log('Shader compiler log: ' + compilationLog);
+                }
+            };
+
+            const vertShader = gl.createShader(gl.VERTEX_SHADER);
+            gl.shaderSource(vertShader, vertCode);
+            gl.compileShader(vertShader);
+            log(vertShader);
+            
+        
+            const fragShader = gl.createShader(gl.FRAGMENT_SHADER);
+            gl.shaderSource(fragShader, fragCode); 
+            gl.compileShader(fragShader);
+            log(fragShader);
+            
+            const shaderProgram = gl.createProgram();
+            gl.attachShader(shaderProgram, vertShader);
+            gl.attachShader(shaderProgram, fragShader);
+            gl.linkProgram(shaderProgram);
+
+            this.program = shaderProgram
+        }
+
+        cacheUniformLocations(gl, uniformNames) {
+            uniformNames.forEach(name => {
+                const key = `${name}Location`;
+                this[key] = gl.getUniformLocation(this.program, name);
+            });
+        }
+
+        cacheAttributeLocations(gl, attributeNames, enable = false) {
+            attributeNames.forEach(name => {
+                const key = `${name}Locaton`;
+                const location = gl.getAttribLocation(this.program, name);
+                this[key] = location;
+                if (enable) {
+                    gl.enableVertexAttribArray(location);
+                }
+            })
+        }
+    }
+
+    class Viz {
+        constructor() {
+            this.canvas = document.getElementById('canvas');
+            // Enable opacity.
+            this.ctx = this.canvas.getContext('webgl2', {
+                antialias: true,
+                premultipliedAlpha: false,
+            });
+            const tl = [-1, -1];
+            const bl = [-1, 1];
+            const tr = [1, -1];
+            const br = [1, 1];
+
+            const tlUv = [0, 0];
+            const blUv = [0, 1];
+            const trUv = [1, 0];
+            const brUv = [1, 1];
+
+            this.state = {
+                // Coords and UVs
+                rawBuffer: new Float32Array([
+                    ...tl,
+                    ...tlUv,
+                    ...bl,
+                    ...blUv,
+                    ...tr,
+                    ...trUv,
+                    ...br,
+                    ...brUv,
+                ]),
+                buffer: null,
+                rawTextureBuffer: null,
+                texture: null,
+                textureDimensions: { height: 16, width: 16 },
+            };
+
+            this.setupGL();
+            this.draw();
+        }
+
+        setupGL() {
+            const { ctx: gl } = this;
+
+            gl.enable(gl.BLEND);
+            gl.clearColor(0.0, 0.0, 0.0, 0.0);
+            gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+
+            this.setupShaders();
+            this.setupBuffer();
+            this.setupTexture();
+        }
+
+        setupShaders() {
+            const { ctx: gl } = this;
+
+            const uniforms = [
+                'texture_buffer',
+                'texture_buffer_dimensions'
+            ];
+
+            const attributes = [
+                'position',
+                'uv',
+            ];
+
+            const vertCodeCircle =
+                '#version 300 es\n' +
+                'precision mediump float;' +
+                'in vec2 position;' +
+                'out vec2 v_position;' +
+
+                'void main(void) {' +
+                    'v_position = position;' +
+                    'gl_Position = vec4(position, 0.0, 1.0);' +
+                '}';
+
+            const fragCodeCircle =
+                '#version 300 es\n' +
+                'precision mediump float;' +
+                'precision highp usampler2D;' +
+                'uniform usampler2D texture_buffer;' +
+                'uniform vec2 texture_buffer_dimensions;' +
+                'in vec2 v_position;' +
+                'out vec4 FragColor;' +
+
+                'void main(void) {' +
+                    // Shift position from [-1, 1] to [0, 1]
+                    'vec2 n_position = (v_position + vec2(1.)) * 0.5;' +
+                    'uvec4 int_colour = texture(texture_buffer, n_position);' +
+                    // Only get a red integer contribution from the buffer, since
+                    // that's all that should be stored in the texture.
+                    'vec3 colour = vec3(int_colour.rrr) / 255.0;' +
+                    'FragColor = vec4(colour, 1.);' +
+                '}';
+
+            this.state[SHADER_NAME] = new Shader(gl, vertCodeCircle, fragCodeCircle);
+            this.state[SHADER_NAME].cacheUniformLocations(gl, uniforms);
+            this.state[SHADER_NAME].cacheAttributeLocations(gl, attributes, false);
+
+            // We reuse the same shader over and over, so we an make this the program we use right here.
+            // If we need to switch shaders between draw calls, we'll then have to move this to draw()
+            const { [SHADER_NAME]: shader } = this.state;
+            const { program } = shader;           
+
+            gl.useProgram(program);
+        }
+
+        setupBuffer() {
+            const { ctx: gl } = this;
+            this.state.buffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.state.buffer);
+            gl.bufferData(gl.ARRAY_BUFFER, this.state.rawBuffer, gl.STATIC_DRAW);
+            gl.bindBuffer(gl.ARRAY_BUFFER, null);
+        }
+
+        setupTexture() {
+            const { ctx: gl } = this;
+            // Make 1-byte values which will be sampled from in the shader.
+            // Basically this is a byte-buffer which we can store uint8 bytes of data and then
+            // read them out in either shader.
+            this.state.rawTextureBuffer = [];
+
+            // const dimensions = { height: 1, width: 8 }
+            // for (let i = 1; i <= 8; i += 1) {
+            //     this.state.rawTextureBuffer.push(2 ** i - 1);
+            // }
+
+            // const dimensions = { height: 8, width: 8 };
+            // for (let i = 0; i <= 64; i += 1) {
+            //     this.state.rawTextureBuffer.push(255 * i/64);
+            // }
+
+            // const dimensions = { height: 1, width: 256 };
+            for (let i = 0; i <= 255; i += 1) {
+                this.state.rawTextureBuffer.push(i);
+            }
+
+            this.state.texture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, this.state.texture);
+            // Can't filter integer textures.
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            this.uploadTextureData();
+            gl.bindTexture(gl.TEXTURE_2D, null);
+        }
+
+        uploadTextureData() {
+            const { ctx: gl } = this;
+
+            gl.texImage2D(
+                gl.TEXTURE_2D,
+                0,
+                // internal format
+                gl.R8UI,
+                // 256 total uint8 values to use in the texture. 16*16 = 256 so we can sample
+                // from bottom to top.
+                // width
+                this.state.textureDimensions.width,
+                // height
+                this.state.textureDimensions.height,
+                0,
+                // source format
+                gl.RED_INTEGER,
+                // source type
+                gl.UNSIGNED_BYTE,
+                // texture data
+                new Uint8Array(this.state.rawTextureBuffer)
+            );
+        }
+
+        advanceTexture() {
+            const { ctx: gl } = this;
+            for (let i = 0; i < this.state.rawTextureBuffer.length; i++) {
+                // Relies on wraparound so that when we hit 256 it goes back to 0
+                // after making the uint8 array.
+                this.state.rawTextureBuffer[i]++;
+                // if (this.state.rawTextureBuffer[i] > 255) {
+                //     this.state.rawTextureBuffer[i] = 0;
+                // }
+            }
+            gl.bindTexture(gl.TEXTURE_2D, this.state.texture);
+            this.uploadTextureData();
+            gl.bindTexture(gl.TEXTURE_2D, null);
+        }
+
+        draw() {
+            const { ctx: gl } = this;
+            const { [SHADER_NAME]: shader, buffer, rawBuffer, texture } = this.state;
+            const { program } = shader;           
+
+            // We reuse the shader, so no need to bind it over and over.
+            // gl.useProgram(program);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+
+            gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+            // Need to enable now because no buffer is bound when we cache their locations.
+            gl.enableVertexAttribArray(shader.positionLocation);
+            // gl.enableVertexAttribArray(shader.uvLocation);
+            gl.vertexAttribPointer(shader.positionLocation, 2, gl.FLOAT, false, 16, 0);
+            // gl.vertexAttribPointer(shader.uvLocation, 2, gl.FLOAT, false, 16, 2 * Float32Array.BYTES_PER_ELEMENT);
+
+            // Set the active texture.
+            gl.activeTexture(gl.TEXTURE0); 
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            // Bind our texture to the texture slot 0
+            gl.uniform1i(shader.texture_bufferLocation, 0);
+            gl.uniform2fv(shader.texture_buffer_dimensionsLocation, new Float32Array([this.state.rawTextureBuffer.length, 1]));
+
+            // 24 data values (2 * 6 verts + 2 * 6 uvs, gives us 6 points to draw.)
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, rawBuffer.length / 4);
+        }
+    }
+
+    const viz = new Viz();
+
+    // Main render loop, keep redrawing the scene. It could probably be done in response to changes
+    // to the controls on the page, but this is okay for now.
+    let prevT;
+    const delay = 100;
+    function render(t) {
+        if (prevT === undefined || t - prevT > delay) {
+            prevT = t;
+            viz.draw();
+            viz.advanceTexture();
+        }
+        requestAnimationFrame(render);
+    }
+
+    render();
+
+    </script>
+</html>

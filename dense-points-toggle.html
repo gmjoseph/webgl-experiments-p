@@ -1,0 +1,429 @@
+<html>
+    <head>
+        <title>Desnse Points Toggle WebGL</title>
+        <style>
+            body {
+                background-color: black;
+                margin: 0;
+                padding: 0;
+            }
+            #main {
+                display: flex;
+                height: 100%;
+                justify-content: center;
+                align-items: center;
+            }
+            canvas {
+                max-height: 100%;
+            }
+        </style>
+    </head>
+    <body>
+        <section id="main">
+            <canvas id="canvas" height="1280" width="1280"></canvas>
+        </section>
+    </body>
+    <script>
+
+    // Make N random points between -1, 1 on both axes.
+    const POINTS_PER_BUFFER = 200000;
+    // Number of buffers each containing that N number of points.
+    const BUFFER_COUNT = 10;
+    // Circle or ellipse shader
+    const SHADER_NAME = 'circleShader';
+
+    class Controller {
+        // Each buffer can control its opacity and colour separately from others. We can also
+        // wholesale enable/disable the buffer, at which point the draw call for it won't happen in
+        // the Viz class.
+        constructor(bufferCount) {
+            // Keep a reference to all the dom elements.
+            this.controls = [];
+            this.addControls(bufferCount);
+        }
+
+        generateColour() {
+            // https://stackoverflow.com/a/4745393
+            function convert(integer) {
+                const str = Number(integer).toString(16);
+                return str.length == 1 ? "0" + str : str;
+            };
+
+            const r = Math.floor(Math.random() * 256);
+            const g = Math.floor(Math.random() * 256);
+            const b = Math.floor(Math.random() * 256);
+            const hex = `#${convert(r)}${convert(g)}${convert(b)}`;
+            return hex;
+        }
+
+        addControls(bufferCount) {
+            const parent = document.createElement('section');
+
+            for (let i = 0; i < bufferCount; i++) {
+                const container = document.createElement('div');
+
+                const radiusInput = document.createElement('input');
+                radiusInput.type = 'range';
+                radiusInput.min = '0.5';
+                radiusInput.max = '30';
+                radiusInput.step = '0.05';
+                radiusInput.value = '2.0';
+                container.appendChild(radiusInput);
+
+                const colourInput = document.createElement('input');
+                colourInput.type = 'color';
+                colourInput.value = this.generateColour();
+                container.appendChild(colourInput);
+
+                const opacityInput = document.createElement('input');
+                opacityInput.type = 'range';
+                opacityInput.min = '0';
+                opacityInput.max = '1';
+                opacityInput.step = '0.05';
+                opacityInput.value = '0.5';
+                container.appendChild(opacityInput);
+
+                const toggleInput = document.createElement('input')
+                toggleInput.type = 'checkbox';
+                toggleInput.checked = true;
+                container.appendChild(toggleInput);
+
+                parent.appendChild(container);
+
+                this.controls.push({
+                    radius: radiusInput,
+                    colour: colourInput,
+                    opacity: opacityInput,
+                    toggle: toggleInput,
+                });
+            }
+
+            document.body.appendChild(parent);
+        }
+
+        getControlValues() {
+            const values = this.controls.map(c => {
+                // It's all strings, so we need to parse them.
+                const { value: radiusRaw } = c.radius;
+                const { value: colourRaw } = c.colour;
+                const { value: opacityRaw } = c.opacity;
+                const { checked: toggleRaw } = c.toggle;
+
+                // https://javascript.plainenglish.io/convert-hex-to-rgb-with-javascript-4984d16219c3
+                const aRgbHex = colourRaw.replace('#', '').match(/.{1,2}/g);
+                const colour = [
+                    parseInt(aRgbHex[0], 16),
+                    parseInt(aRgbHex[1], 16),
+                    parseInt(aRgbHex[2], 16)
+                ];
+                const toggled = toggleRaw;
+                const opacity = parseFloat(opacityRaw);
+                const radius = parseFloat(radiusRaw);
+                return { radius, colour, opacity, toggled };
+            });
+            return values;
+        }
+    }
+
+    class Shader {
+        constructor(gl, vertCode, fragCode) {
+            this.program = null;
+            this.setupShader(gl, vertCode, fragCode);
+        }
+
+        setupShader(gl, vertCode, fragCode) {
+            const log = (shader) => {
+                const compiled = gl.getShaderParameter(shader, gl.COMPILE_STATUS);
+                if (!compiled) {
+                    console.log('Shader compiled failed: ' + compiled);
+                
+                    const compilationLog = gl.getShaderInfoLog(shader);
+                    console.log('Shader compiler log: ' + compilationLog);
+                }
+            };
+
+            const vertShader = gl.createShader(gl.VERTEX_SHADER);
+            gl.shaderSource(vertShader, vertCode);
+            gl.compileShader(vertShader);
+            log(vertShader);
+            
+        
+            const fragShader = gl.createShader(gl.FRAGMENT_SHADER);
+            gl.shaderSource(fragShader, fragCode); 
+            gl.compileShader(fragShader);
+            log(fragShader);
+            
+            const shaderProgram = gl.createProgram();
+            gl.attachShader(shaderProgram, vertShader);
+            gl.attachShader(shaderProgram, fragShader);
+            gl.linkProgram(shaderProgram);
+
+            this.program = shaderProgram
+        }
+
+        cacheUniformLocations(gl, uniformNames) {
+            uniformNames.forEach(name => {
+                const key = `${name}Location`;
+                this[key] = gl.getUniformLocation(this.program, name);
+            });
+        }
+
+        cacheAttributeLocation(gl, attributeName, enable = false) {
+            const key = `${attributeName}Locaton`;
+            const location = gl.getAttribLocation(this.program, 'coordinate');
+            this[key] = location;
+            if (enable) {
+                gl.enableVertexAttribArray(location);
+            }
+        }
+    }
+
+    class PointBuffer {
+        constructor(gl) {
+            this.buffer = null;
+            // Sensible defaults which will all get overwritten before the first render.
+            // Store rgba, opacity is stored separately.
+            this.colour = new Float32Array(3);
+            this.opacity = 1.0;
+            this.radius = 1.0;
+            this.toggled = true;
+
+            this.setupPoints();
+            this.setupBuffer(gl);
+        }
+
+        setupPoints() {
+            this.length = POINTS_PER_BUFFER;
+            this.points = new Float32Array(this.length * 2);
+
+            for (let i = 0; i < this.length; i += 2) {
+                const x = Math.random() * 2 - 1;
+                const y = Math.random() * 2 - 1;
+                this.points[i] = x;
+                this.points[i + 1] = y;
+            }
+        }
+
+        setupBuffer(gl) {
+            this.buffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
+            gl.bufferData(gl.ARRAY_BUFFER, this.points, gl.STATIC_DRAW);
+            gl.bindBuffer(gl.ARRAY_BUFFER, null);
+        }
+
+        updateBuffer(visualState) {
+            const { radius, colour, opacity, toggled } = visualState;
+            // We already allocated the Float32Array so we now need to fill it.
+            // This is to avoid reallocating a bunch of those arrays at each render.
+            this.radius = radius;
+            this.colour[0] = colour[0] / 255;
+            this.colour[1] = colour[1] / 255;
+            this.colour[2] = colour[2] / 255;
+            this.opacity = opacity;
+            this.toggled = toggled;
+        }
+    }
+
+    class Viz {
+        constructor(bufferCount) {
+            this.canvas = document.getElementById('canvas');
+            // Enable opacity.
+            this.ctx = this.canvas.getContext('webgl', {
+                antialias: true,
+                premultipliedAlpha: false,
+            });
+            this.state = {
+                scale: 1.0,
+                resolution: new Float32Array([this.canvas.width, this.canvas.height]),
+            };
+
+            this.setupEvents();
+            this.setupGL(bufferCount);
+            this.draw();
+        }
+
+        setupEvents() {
+            window.addEventListener("wheel", event => {
+                event.preventDefault();
+                if (event.deltaY < 0) {
+                    this.state.scale += 0.15;
+                } else {
+                    this.state.scale -= 0.15;
+                }
+                return false;
+            }, { passive: false });
+        }
+
+        setupGL(bufferCount) {
+            const { ctx: gl } = this;
+
+            gl.enable(gl.BLEND);
+            gl.clearColor(0.0, 0.0, 0.0, 0.0);
+            gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+
+            this.setupShaders();
+
+            // 200,000 random points per buffer, 10 buffers, 2 million points in total.
+            this.state.pointBuffers = [];
+            for (let i = 0; i < bufferCount; i++) {
+                const pointBuffer = new PointBuffer(gl);
+                this.state.pointBuffers.push(pointBuffer);
+            }
+        }
+
+        setupShaders() {
+            const { ctx: gl } = this;
+
+            const uniforms = [
+                'colour',
+                'opacity',
+                'radius',
+                'scale',
+                'resolution',
+            ];
+
+            // TODO
+            // Possible optimization so we don't have to divide per vertex to get the screen coordinate
+            // is to precompute it and include it in a vec4 for the coordinate, where zw is the screen coordinate
+            // and xy is the [-1, 1] space coordinate.
+
+            // TODO
+            // There not sure how well antialiasing is working when we draw circles/ellipses manually (probably
+            // not really, since we keep or discard fragments, which creates a hard edge). It might
+            // help to render to an offscreen buffer and then use an FXAA technique.
+            // See threejs's for example:
+            // https://threejs.org/examples/webgl_postprocessing_fxaa.html
+            //
+            // FXAA fragment shader implementation (we don't need the vertex shader, it should be a quad):
+            // https://github.com/kosua20/Rendu/blob/master/resources/common/shaders/screens/fxaa.frag
+            //
+            // Also consider SMAA as an alternative to FXAA
+            // http://www.iryoku.com/smaa/
+
+            // http://gamedusa.blogspot.com/2007/05/drawing-circle-primitives-using.html
+            // Put the coordinate into screenspace so that it can be tested against the fragment
+            // in the fragment shader (screenCoordinate).
+            // I.e. if all positions at [-1, 1], we put them from [0, windowWidth] and [0, windowHeight].
+            // We have to do that because gl_Fragcoord is in that same coordinate space, not the normalized
+            // one. It's also easier to think of our radius in screen coordinates, otherwise we'd be dealing
+            // with a radius that could be something like 0.00001 or smaller, which is just a pain to
+            // even relate back to what we see on the screen.
+            const vertCodeCircle =
+                'precision mediump float;' +
+                'attribute vec2 coordinate;' +
+                'varying vec2 screenCoordinate;' +
+                'uniform float scale;' +
+                'uniform float radius;' +
+                'uniform vec2 resolution;' +
+
+                'void main(void) {' +
+                    // Big enough point size to ensure fragment coverage around the point.
+                    // That is, we won't just get a single pixel fragment at the point in the fragment
+                    // shader, we will get more. The fragment shader will then use a distance function
+                    // to actually draw a circle within the fragments given by the point here.
+                    // The result is we get more fragments then we need (imagine a circle inscribed
+                    // in a square, and then we trim away the square pixels).
+                    'vec2 scaledCoordinate = coordinate * scale;' +
+                    'vec2 halfsize = resolution * 0.5;' +
+                    'screenCoordinate = halfsize + scaledCoordinate * halfsize;' +
+                    // We're making this into the diameter of the square that is the point, that is why
+                    // we multiply by 2.
+                    'gl_PointSize = radius * 2.0;' +
+                    'gl_Position = vec4(scaledCoordinate, 0.0, 1.0);' +
+                '}';
+
+            // We ensured with gl_PointSize in the vertex shader that we have enough fragment coverage
+            // around each point in order to draw circle inside of it using the distance function
+            // below.
+            // As a result, if a fragment of the square-shaped point isn't inside the inscribed circle
+            // we discard the fragment.
+            const fragCodeCircle =
+                'precision mediump float;' +
+                'varying vec2 screenCoordinate;' +
+                'uniform vec3 colour;' +
+                'uniform float opacity;' +
+                'uniform float radius;' +
+                'uniform vec2 resolution;' +
+
+                'void main(void) {' +
+                    // Is the fragment for the current point within the circle we want to draw?
+                    'float d = distance(screenCoordinate, gl_FragCoord.xy);' +
+                    'if (d > radius) {' +
+                        'discard;' +
+                    '}' +
+                    'gl_FragColor = vec4(colour, opacity);' +
+                '}';
+
+            this.state.circleShader = new Shader(gl, vertCodeCircle, fragCodeCircle);
+            this.state.circleShader.cacheUniformLocations(gl, uniforms);
+            this.state.circleShader.cacheAttributeLocation(gl, 'coordinate', true);
+
+            // We reuse the same shader over and over, so we an make this the program we use right here.
+            // If we need to switch shaders between draw calls, we'll then have to move this to draw()
+
+            const { [SHADER_NAME]: shader } = this.state;
+            const { program } = shader;           
+
+            gl.useProgram(program);
+        }
+
+        updateBuffers(visualState) {
+            this.state.pointBuffers.forEach((b, i) => {
+                b.updateBuffer(visualState[i]);
+            });
+        }
+
+        draw() {
+            const { ctx: gl } = this;
+            const { [SHADER_NAME]: shader } = this.state;
+            const { program } = shader;           
+
+            // We reuse the shader, so no need to bind it over and over.
+            // gl.useProgram(program);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+
+            this.state.pointBuffers.forEach(pointBuffer => {
+                if (!pointBuffer.toggled) {
+                    return;
+                }
+
+                gl.bindBuffer(gl.ARRAY_BUFFER, pointBuffer.buffer);
+
+                // Pretty sure this must be done once per buffer that we bind.
+                gl.vertexAttribPointer(shader.coordinateLocation, 2, gl.FLOAT, false, 8, 0);
+                gl.uniform3fv(shader.colourLocation, pointBuffer.colour);
+                gl.uniform1f(shader.opacityLocation, pointBuffer.opacity);
+                gl.uniform1f(shader.radiusLocation, pointBuffer.radius);               
+                gl.uniform1f(shader.scaleLocation, this.state.scale);
+                // Kinda squirrely, 32-bit integer vector might be more suitable but a 32-bit float can also hold
+                // the resolution just fine even if it is technically an integer value.
+                gl.uniform2fv(shader.resolutionLocation, this.state.resolution);
+
+                gl.drawArrays(gl.POINT, 0, pointBuffer.length);
+            });
+        }
+    }
+
+    // How many buffers of POINTS_PER_BUFFER points each we want to make.
+    const bufferCount = BUFFER_COUNT;
+
+    const controller = new Controller(bufferCount);
+    const viz = new Viz(bufferCount);
+
+    // Main render loop, keep redrawing the scene. It could probably be done in response to changes
+    // to the controls on the page, but this is okay for now.
+    function render() {
+        // 1. read controls
+        // TODO
+        // Maybe don't do the step 1 for every frame since it won't be needed unless something changed.
+        // 2. draw viz
+        const visualState = controller.getControlValues();
+        viz.updateBuffers(visualState);
+        viz.draw();
+        requestAnimationFrame(render);
+    }
+
+    render();
+
+    </script>
+</html>

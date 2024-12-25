@@ -1,0 +1,529 @@
+<html>
+    <head>
+        <title>Selection Bitmap WebGL</title>
+        <style>
+            body {
+                background-color: black;
+                margin: 0;
+                padding: 0;
+            }
+            #main {
+                display: flex;
+                height: 100%;
+                justify-content: center;
+                align-items: center;
+            }
+            canvas {
+                max-height: 100%;
+            }
+        </style>
+    </head>
+    <body>
+        <section id="main">
+            <canvas id="canvas" height="1280" width="1280"></canvas>
+            <canvas id="debugCanvas" height="512" width="512"></canvas>
+        </section>
+    </body>
+    <script>
+
+    class SelectionViz {
+        // webgl stuff
+
+        constructor(model) {
+            this.canvas = document.getElementById('canvas');
+            this.debugCanvas = document.getElementById('debugCanvas');
+            
+            // todo
+            // Make this webgl.
+            this.ctx = this.canvas.getContext('webgl');
+            this.debugCtx = this.debugCanvas.getContext('2d');
+            this.model = model;
+            this.painting = false;
+            this.glState = {};
+
+            this.setupCanvas();
+            this.setupGL();
+            // first draw
+            this.update();
+        }
+
+        setupCanvas() {
+            this.canvas.onclick = this.handleClick;
+            // paint draw
+            this.canvas.onmousedown = this.handleMouseDown;
+            this.canvas.onmousemove = this.handleMouseMove;
+            this.canvas.onmouseup = this.handleMouseUp;
+        }
+
+        setupGL() {
+            const { ctx: gl } = this;
+
+            gl.enable(gl.DEPTH_TEST);
+            gl.enable(gl.POINT_SMOOTH);
+            gl.clearColor(0.0, 0.0, 0.0, 0.0);
+            gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+
+            this.setupBuffersGL(gl);
+            this.setupShaderGL(gl);
+            this.setupTextureGL(gl);
+        }
+
+        setupBuffersGL(gl) {
+            const vertices = this.model.vertices.reduce((acc, v) => {
+                // https://stats.stackexchange.com/a/178629
+                // gl is [-1, 1] on both axes
+                const glx = (v.x / this.canvas.width - 0.5) * 2;
+                // y is down in canvas, up in gl
+                const gly = -(v.y / this.canvas.height - 0.5) * 2;
+                acc.push(glx);
+                acc.push(gly);
+                acc.push(v.bitIdx);
+                acc.push(v.byteIdx);
+                return acc;
+            }, []);
+
+
+            // fill the coordinates and index buffer
+            this.glState.vertexBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.glState.vertexBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertices), gl.STATIC_DRAW);
+            gl.bindBuffer(gl.ARRAY_BUFFER, null);
+            this.glState.pointCount = this.model.vertices.length;
+        }
+
+        setupShaderGL(gl) {
+            // todo
+            // might be better to not use a bitmap image and instead an array of bytes directly,
+            // if possible:
+            // https://stackoverflow.com/questions/8099979/creating-a-glsl-arrays-of-uniforms
+            // we would know the size up front and could interpolate?
+            // https://stackoverflow.com/questions/42741233/unsigned-byte-in-glsl#:~:text=GLSL%20doesn%27t%20deal%20in%20sized%20types%20%28well%2C%20not,a%20uint%20type%2C%20which%20is%2032-bits%20in%20size.
+            const log = (shader) => {
+                const compiled = gl.getShaderParameter(shader, gl.COMPILE_STATUS);
+                if (!compiled) {
+                    console.log('Shader compiled failed: ' + compiled);
+                
+                    const compilationLog = gl.getShaderInfoLog(shader);
+                    console.log('Shader compiler log: ' + compilationLog);
+                }
+            };
+
+            // Vertex shader source code
+            // data.xy = coordinate
+            // data.z = bitIdx
+            // data.w = byteIdx
+            // it would take a vec4 slot anyway if we passed things separately
+            const vertCode =
+                'attribute vec4 data;' +
+
+                'varying highp float bitIdx;' +
+                'varying highp float byteIdx;' +
+                    
+                'void main(void) {' +
+                    // to see that these are actually indices we need to scale them within [-1, 1]
+                    // for visualization purposes
+                    // 'vec2 position = data.zw * 0.004;' +
+                    'vec2 position = data.xy;' +
+                    'bitIdx = data.z;' +
+                    'byteIdx = data.w;' +
+
+                    'gl_PointSize = 10.0;' +
+                    'gl_Position = vec4(position, 0.0, 1.0);' +
+                '}';
+            const vertShader = gl.createShader(gl.VERTEX_SHADER);
+            gl.shaderSource(vertShader, vertCode);
+            gl.compileShader(vertShader);
+            log(vertShader);
+
+            // fragment shader source code
+            const fragCode =
+                'precision mediump float;' +
+
+                `uniform sampler2D bitmap;` +
+
+                'varying highp float bitIdx;' +
+                'varying highp float byteIdx;' +
+
+                'void main(void) {' +
+                    'vec2 uv = vec2(byteIdx, 1.0);' +
+                    'vec4 pixel = texture2D(bitmap, uv);' +
+
+                    'gl_FragColor = vec4(pixel.a, 1.0, 1.0, 1.0);' +
+                '}';
+        
+            const fragShader = gl.createShader(gl.FRAGMENT_SHADER);
+            gl.shaderSource(fragShader, fragCode); 
+            gl.compileShader(fragShader);
+            log(fragShader);
+            
+            // Create a shader program object to store
+            // the combined shader program
+            const shaderProgram = gl.createProgram();
+            gl.attachShader(shaderProgram, vertShader);
+            gl.attachShader(shaderProgram, fragShader);
+            gl.linkProgram(shaderProgram);
+
+
+            this.glState.shaderProgram = shaderProgram
+        }
+
+        setupTextureGL(gl) {
+            const texture = gl.createTexture();
+            this.glState.texture = texture;
+        }
+
+        update() {
+            const { ctx: gl } = this;
+            gl.useProgram(this.glState.shaderProgram);
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.glState.vertexBuffer);
+
+            // pass attributes
+            // [x, y, bitIdx, byteIdx]
+            // [4 bytes, 4 bytes, 4 bytes, 4 bytes]
+
+            // todo
+            // see if indicies can be passed as ints instead?
+            const dataLocation = gl.getAttribLocation(this.glState.shaderProgram, 'data');
+            gl.vertexAttribPointer(dataLocation, 4, gl.FLOAT, false, 16, 0);
+            gl.enableVertexAttribArray(dataLocation);
+
+            this.updateTexture(gl);
+
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            gl.drawArrays(gl.POINT, 0, this.glState.pointCount);
+            this.updateDebug();
+        }
+
+        updateTexture(gl) {
+            // todo
+            // stop doing power-of-2 textures for now so that it's easier to look up the bit
+            // later on in the shader because then it's just a straight offset from the beginning
+            // rather than looking up a row and column
+            // 1. put the latest buffer data for the texture in gfx memory
+            // 2. find its uniform location and send the data over
+
+            gl.bindTexture(gl.TEXTURE_2D, this.glState.texture);
+            const level = 0;
+            const internalFormat = gl.ALPHA;
+            const width = this.model.bitmapWidth;
+            const height = this.model.bitmapHeight;
+            const border = 0;
+            const srcFormat = gl.ALPHA;
+            const srcType = gl.UNSIGNED_BYTE;
+            const pixel = this.model.bitmap;
+
+            console.log(this.model.bitmap);
+
+            gl.texImage2D(
+                gl.TEXTURE_2D,
+                level,
+                internalFormat,
+                width,
+                height,
+                border,
+                srcFormat,
+                srcType,
+                pixel
+            );
+
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+
+            // it's not going to be a power of two for now
+            // gl.generateMipmap(gl.TEXTURE_2D);
+
+            const bitmap = gl.getUniformLocation(this.glState.shaderProgram, 'bitmap');
+            gl.activeTexture(gl.TEXTURE0);
+            gl.uniform1i(bitmap, 0);
+
+            gl.bindTexture(gl.TEXTURE_2D, null);
+        }
+
+        updateDebug() {
+            // draw whatever is in the model
+            // probably involves binding the bitmap, updating the texture
+            const { debugCtx: ctx } = this;
+
+            ctx.clearRect(0, 0, this.debugCanvas.width, this.debugCanvas.height);
+
+            this.model.vertices.forEach(v => {
+                // debug is smaller so just scale in all the coordinates
+                const scaleX = this.debugCanvas.width / this.canvas.width;
+                const scaleY = this.debugCanvas.height / this.canvas.height;
+
+                if (scaleX !== scaleY) {
+                    throw new Error('Mismatched scale', scaleX, scaleY);
+                }
+
+                //  should be the same anyway
+                const scaleR = scaleX * this.model.vertexRadius;
+                const selected = this.model.vertexSelected(v.bitIdx);
+                ctx.beginPath();
+                ctx.arc(v.x * scaleX, v.y * scaleY, scaleR, 0, Math.PI * 2);
+                ctx.fillStyle = selected ? 'green' : 'white';
+                ctx.fill();
+            });
+        }
+
+        getEventCoords(e) {
+            // Local coordinates - probably a better way but whatever.
+            const rect = canvas.getBoundingClientRect()
+            const cx = event.clientX - rect.left
+            const cy = event.clientY - rect.top
+            return { x: cx, y: cy };
+        }
+
+        handleClick = (e) => {
+            const coords = this.getEventCoords(e);
+            this.model.selectVertex(coords, 'toggle');
+            // if the selection changed we need to refresh the visual
+            this.update();
+        };
+
+        handleMouseDown = (e) => {
+            this.painting = true;
+        }
+
+        handleMouseMove = (e) => {
+            if (!this.painting) {
+                return;
+            }
+
+            const coords = this.getEventCoords(e);
+            this.model.selectVertex(coords, 'select');
+            // if the selection changed we need to refresh the visual
+            this.update();
+        };
+        
+        handleMouseUp = (e) => {
+            this.painting = false;
+        }
+    }
+
+    class SelectionModel {
+        // points and their selection state, and a bitmap that reflects that
+        // selection state
+
+        constructor(vertices) {
+            const randomPointCount = 50000;
+            const step = 24;
+
+            this.vertices = vertices;
+            if (!vertices) {
+                this.vertices = [];
+                // for (let i = 0; i < randomPointCount; i++) {
+                //     const x = 1280 * Math.random();
+                //     const y = 1280 * Math.random();
+                //     const idx = i;
+                //     this.vertices.push({ x, y, idx });
+                // }
+                // 
+                let idx = 0;
+                let byteIdx = 0;
+                for (let y = 0; y <= 1280; y += step) {
+                    for (let x = 0; x <= 1280; x += step) {
+                        this.vertices.push({
+                            x ,
+                            y,
+                            idx,
+                            // the single bit for selections
+                            bitIdx: idx,
+                            // the byte that this bitIdx is grouped with
+                            byteIdx: Math.floor(idx / 8),
+                        });
+                        idx++;
+                    }
+                }
+            }
+
+            console.log(this.vertices);
+
+            this.selections = new Set();
+            this.vertexRadius = 10;
+            // bigger radius so we don't have to be as acurate when selecting points
+            this.selectionRadius = 50;
+
+            this.setupBitmap();
+            this.debugBitmap();
+        }
+
+        setupBitmap() {
+            const bytesNeeded = Math.ceil(this.vertices.length / 8);
+            console.log("bytes needed", bytesNeeded);
+
+            this.debugCanvas = document.createElement('canvas');
+            this.debugCanvas.width = bytesNeeded;
+            this.debugCanvas.height = 64;
+            this.debugCtx = this.debugCanvas.getContext('2d');
+            
+            // we're working at a bit depth of 8 bits (1 byte) but the canvas image data
+            // is at a bitdepth of 32 bits (4 bytes, rgba)
+            // that is why we divide by 4 and round up
+            const imageDataDimension = Math.ceil(bytesNeeded / 4);
+
+            // todo
+            // make a uint8clamped array instead to fill up with bytes?
+            // we have 1 byte per pixel in theory, but this will allocate 4 bytes per pixel
+            // so we'll need to deal in multiples of four for this...
+            this.bitmapDebug = this.debugCtx.createImageData(bytesNeeded, 1);
+
+            // todo
+            // this is what ultimately will go to graphics hardware
+            this.bitmap = new Uint8ClampedArray(bytesNeeded);
+            this.bitmapWidth = bytesNeeded;
+            this.bitmapHeight = 1;
+            this.bitmapSize = bytesNeeded;
+        }
+
+        // this makes the bitmap a 2d array, where both edges are the smallest power of 2
+        // that can hold all the data
+        // to keep things simpler in the shader, i'm sending a non-power-of-two image so
+        // that looking things up in a 1d array is easier since height is always 1 and
+        // the x is just the bitIdx within the byte group
+        // setupBitmap() {
+        //     // todo
+        //     // i think this is storing way more data in the bitmap then is needed (it should
+        //     // still work though but we can send a smaller one. probably something with the
+        //     // bit to byte conversion, the squaring or log2 stuff...)
+
+        //     // bitmap dynamically sized in powers of 2 increments based on number of verts
+        //     // each vertex gets one bit to reflect seleciton so whatever it is can be divided
+        //     // by 8 or 2^3
+        //     // todo
+
+        //     // we have 1D array of bits, but we need to arrange them in a 2D matrix,
+        //     // so divide by 8 (bits -> bytes conversion) and take the sqrt
+        //     // now we have the length of one side
+        //     const bytesNeeded = this.vertices.length / 8;
+        //     const bytesNeededEdge = Math.sqrt(this.vertices.length / 8);
+
+        //     // now we need to get the next biggest power of two, so for that we
+        //     // take the log2 of the bytes, this gives us some number raised to 2
+        //     // then we round that up, and raise it to 2 again for the final edge
+        //     // value.
+        //     // e.g. if we need to store 64 bits, that's 8 bytes
+        //     // sqrt of 8 is < 3 so when we take the log2 of that it's around 2.8
+        //     // then we take the log2 of that, and 2 must be raised to 1.something to
+        //     // get to 2.8.
+        //     // we round up that 1.something to 2 and then raise 2 to it. after that
+        //     // the length of one dimension is 4.
+        //     // so 4x4 bytes is 16 bytes. 16 * 8 bytes holds 128 bits, enough for 64 bits
+        //     // the reason the amount of storage goes up a lot 
+        //     // but if it's 65 bits, that wouldn't fit in 8x8 (i.e. 64 
+        //     // tl;dr round up edge length to nearest power of 2 edge length
+        //     const dimension = 2 ** Math.ceil(Math.log2(bytesNeededEdge));
+
+        //     // is guaranteed to be a power of 2
+        //     const totalBytesNeeded = dimension * dimension;
+
+        //     console.log("bytes needed, dimension, total bytes needed", bytesNeeded, dimension, totalBytesNeeded);
+
+        //     this.debugCanvas = document.createElement('canvas');
+        //     this.debugCanvas.width = dimension;
+        //     this.debugCanvas.height = dimension;
+        //     this.debugCtx = this.debugCanvas.getContext('2d');
+            
+        //     // we're working at a bit depth of 8 bits (1 byte) but the canvas image data
+        //     // is at a bitdepth of 32 bits (4 bytes, rgba)
+        //     // that is why we divide by 4 and round up
+        //     const imageDataDimension = Math.ceil(dimension / 4);
+
+        //     // todo
+        //     // make a uint8clamped array instead to fill up with bytes?
+        //     // we have 1 byte per pixel in theory, but this will allocate 4 bytes per pixel
+        //     // so we'll need to deal in multiples of four for this...
+        //     this.bitmapDebug = this.debugCtx.createImageData(dimension, dimension);
+
+        //     // todo
+        //     // this is what ultimately will go to graphics hardware
+        //     this.bitmap = new Uint8ClampedArray(totalBytesNeeded);
+        //     this.bitmapDimension = dimension;
+        //     this.bitmapSize = totalBytesNeeded;
+        // }
+
+        debugBitmap() {
+            // can live in memory if since we're going to turn it into a webgl texture
+            // and send it to the hardware
+            document.body.appendChild(this.debugCanvas);
+        }
+
+        updateBitmap(bitIdx, byteIdx) {
+            // since the bitmap is made up of an image that's just a flat array of
+            // bytes, we can directly target the byte in the image by the byteIdx
+            const bitStartIdx = byteIdx * 8;
+            let byte = 0;
+
+            // todo
+            // this might be the wrong order for reading back in the gpu
+            for (let i = 0; i < 8; i++) {
+                const idx = bitStartIdx + i;
+                if (this.selections.has(idx)) {
+                    byte |= (1 << i);
+                }
+            }
+
+            this.bitmap[byteIdx] = byte;
+
+            // rgba
+            const bitmapDebugIdx = byteIdx * 4;
+            this.bitmapDebug.data[bitmapDebugIdx] = byte;
+            this.bitmapDebug.data[bitmapDebugIdx + 1] = byte;
+            this.bitmapDebug.data[bitmapDebugIdx + 2] = byte;
+            this.bitmapDebug.data[bitmapDebugIdx + 3] = byte;
+
+            // draw the same thing over multiple rows
+            for (let i = 0; i < this.debugCanvas.height; i++) {
+                this.debugCtx.putImageData(this.bitmapDebug, 0, i);
+            }
+        }
+
+        selectVertex({ x: clickX, y: clickY }, type = 'toggle') {
+            // will update the selection if the click location hits a point
+            this.vertices.forEach(({ x, y, idx, bitIdx, byteIdx }) => {
+                let dx = clickX - x;
+                dx *= dx;
+
+                let dy = clickY - y;
+                dy *= dy;
+
+                const d = Math.sqrt(dx + dy);
+
+                // less than the distance of the radius so it's inside the point
+                // if (d < this.vertexRadius) {
+                if (d < this.selectionRadius) {
+
+                    if (type == 'toggle') {
+                        // clicked close enough to a point
+                        if (this.selections.has(idx)) {
+                            this.selections.delete(idx);
+                        } else {
+                            this.selections.add(idx);
+                        }
+                    }
+                    if (type == 'select') {
+                        this.selections.add(idx);
+                    }
+                    if (type == 'deselect') {
+                        this.selections.delete(idx);
+                    }
+
+                    // gotta call this to update the bit in the bitmap which reflects
+                    // selections
+                    this.updateBitmap(bitIdx, byteIdx);
+                }
+            });
+        }
+
+        vertexSelected(bitIdx) {
+            // todo
+            // should read from bit map since that's what the shader will do
+            return this.selections.has(bitIdx);
+        }
+    }
+
+    const model = new SelectionModel();
+    const viz = new SelectionViz(model);
+
+    </script>
+</html>
